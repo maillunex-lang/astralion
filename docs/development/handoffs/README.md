@@ -1,6 +1,7 @@
 # Передача между сессиями и агентами
 
 Первый результат: [INITIAL-AUDIT](INITIAL-AUDIT.md).
+Полная повторная вычитка: [FULL-REVIEW](FULL-REVIEW.md).
 
 Для следующей сессии создать `YYYY-MM-DD-TASK-ID.md` с коротким отчётом:
 

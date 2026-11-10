@@ -5,6 +5,7 @@
 
 | Пакет | Состояние | Владелец | Ветка | Назначение |
 | --- | --- | --- | --- | --- |
+| [AUDIT-004](AUDIT-004.md) | DONE | Codex | docs/full-semantic-review | Завершённая полная вычитка |
 | [FOUNDATION-001](FOUNDATION-001.md) | TODO | не назначен | task/foundation-001 | Следующий готовый к началу пакет |
 | [INFRA-001](INFRA-001.md) | TODO | не назначен | task/infra-001 | После выбора стека |
 

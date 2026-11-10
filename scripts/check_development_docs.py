@@ -28,6 +28,24 @@ def table_rows(text: str):
             yield number, [c.strip() for c in line[1:-1].split('|')]
 
 
+def task_table_rows(text: str):
+    """Читать именно каноническую таблицу, включая ошибочные ID её строк."""
+    in_table = False
+    for number, line in enumerate(text.splitlines(), 1):
+        if not line.startswith('|') or not line.endswith('|'):
+            in_table = False
+            continue
+        cells = [c.strip() for c in line[1:-1].split('|')]
+        if cells[:3] == ['ID', 'Приоритет', 'Статус']:
+            in_table = True
+            continue
+        if in_table and not all(re.fullmatch(r':?-+:?', c) for c in cells):
+            yield number, cells
+        elif not in_table and TASK_ID.fullmatch(cells[0]) and len(cells) == 7:
+            # Отдельно дописанная строка не должна скрывать дубль определения задачи.
+            yield number, cells
+
+
 def expected_stage_status(values: list[str]) -> str:
     states = set(values)
     if states == {'DONE'}:
@@ -70,6 +88,9 @@ def validate(root: Path, source: Path | None = None) -> tuple[list[str], dict]:
             errors.append(f'Нет файла: {path}')
             continue
         content = path.read_text(encoding='utf-8')
+        for value, count in collections.Counter(re.findall(r'<a\s+id="([^"]+)"', content)).items():
+            if count > 1:
+                errors.append(f'{path.name}: повтор HTML-якоря {value}')
         for match in LINK.finditer(content):
             target = (match.group(1) or match.group(2)).strip().strip('<>')
             parsed = urlsplit(target)
@@ -91,11 +112,17 @@ def validate(root: Path, source: Path | None = None) -> tuple[list[str], dict]:
             errors.append(f'{path.name}: неверный ID этапа {sid!r}')
         if sid in stages:
             errors.append(f'Повтор ID этапа: {sid}')
+        if sid != 'STAGE-' + path.name[:2]:
+            errors.append(f'{path.name}: ID этапа не совпадает с именем файла')
+        stage_priority = field(content, 'Приоритет')
+        if stage_priority not in PRIORITIES:
+            errors.append(f'{sid}: неверный приоритет этапа {stage_priority}')
         if status not in STATUSES:
             errors.append(f'{sid}: неверный статус {status}')
         local = []
-        for line, cells in table_rows(content):
+        for line, cells in task_table_rows(content):
             if not TASK_ID.fullmatch(cells[0]):
+                errors.append(f'{path.name}:{line}: неверный ID задачи {cells[0]!r}')
                 continue
             if len(cells) != 7:
                 errors.append(f'{path.name}:{line}: ожидается 7 столбцов')
@@ -124,7 +151,7 @@ def validate(root: Path, source: Path | None = None) -> tuple[list[str], dict]:
         progress = re.search(r'^\*\*Прогресс:\*\*\s*(\d+)/(\d+)', content, re.M)
         if not progress or tuple(map(int, progress.groups())) != (local.count('DONE'), len(local)):
             errors.append(f'{sid}: неверный счёт DONE/всего')
-        stages[sid] = dict(status=status, path=path, done=local.count('DONE'), total=len(local))
+        stages[sid] = dict(status=status, priority=stage_priority, path=path, done=local.count('DONE'), total=len(local))
 
     # Проверяем граф на уровне задач: этапы могут обмениваться результатами подзадач.
     for ident, task in tasks.items():
@@ -164,6 +191,11 @@ def validate(root: Path, source: Path | None = None) -> tuple[list[str], dict]:
         deps = [d.strip() for d in field(content, 'Зависимости').split(',') if d.strip() and d.strip() != '—']
         if set(deps) != set(tasks[ident]['deps']):
             errors.append(f'{ident}: зависимости TASK не совпадают с этапом')
+        if len(deps) != len(set(deps)):
+            errors.append(f'{ident}: повтор зависимости в TASK')
+        stage_link = re.search(r'\]\(([^)]+)\)', field(content, 'Этап'))
+        if not stage_link or (path.parent / stage_link.group(1)).resolve() != stages[tasks[ident]['stage']]['path'].resolve():
+            errors.append(f'{ident}: ссылка TASK на другой этап')
         if not field(content, 'Владелец') or not field(content, 'Ветка'):
             errors.append(f'{ident}: нет владельца/ветки')
         if tasks[ident]['status'] == 'IN_PROGRESS' and field(content, 'Владелец') == 'не назначен':
@@ -183,6 +215,8 @@ def validate(root: Path, source: Path | None = None) -> tuple[list[str], dict]:
             continue
         if cells[3] != stages[sid]['status']:
             errors.append(f'{sid}: статус ROADMAP не совпадает с этапом')
+        if cells[2] != stages[sid]['priority']:
+            errors.append(f'{sid}: приоритет ROADMAP не совпадает с этапом')
         if cells[4] != f'{stages[sid]["done"]}/{stages[sid]["total"]}':
             errors.append(f'{sid}: счёт ROADMAP не совпадает с этапом')
     if seen_stages != set(stages):
@@ -196,6 +230,22 @@ def validate(root: Path, source: Path | None = None) -> tuple[list[str], dict]:
             manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
         except (ValueError, OSError) as exc:
             errors.append(f'Нельзя прочитать манифест: {exc}')
+    if not isinstance(manifest, dict):
+        errors.append('Манифест должен быть объектом')
+        manifest = {}
+    entries = manifest.get('entries', [])
+    if not isinstance(entries, list) or not entries or not all(isinstance(e, dict) for e in entries):
+        errors.append('Манифест: отсутствует непустой список записей источника')
+        entries = []
+    for key, length in [('commit', 40), ('blob', 40), ('sha256', 64)]:
+        if not re.fullmatch(r'[0-9a-f]{' + str(length) + '}', str(manifest.get(key, ''))):
+            errors.append(f'Манифест: неверный {key}')
+    for entry in entries:
+        start, end = entry.get('start'), entry.get('end')
+        if not isinstance(start, int) or not isinstance(end, int) or not 1 <= start <= end <= manifest.get('lines', 0):
+            errors.append(f'Манифест: неверный диапазон {entry.get("id")}')
+        if entry.get('kind') not in {'ТРЕБОВАНИЕ', 'ПРЕДЛОЖЕНИЕ', 'ТЕХПЛАН'}:
+            errors.append(f'Манифест: неверная категория {entry.get("id")}')
     if index_path.is_file():
         index = index_path.read_text(encoding='utf-8')
         ids = re.findall(r'<a id="([^"]+)"></a>([^|\n]+)', index)
@@ -205,14 +255,60 @@ def validate(root: Path, source: Path | None = None) -> tuple[list[str], dict]:
             for value, count in collections.Counter(values).items():
                 if count != 1:
                     errors.append(f'Повтор {label}: {value}')
-        wanted = [e['id'] for e in manifest.get('entries', [])]
+        wanted = [e['id'] for e in entries]
         if len(wanted) != len(set(wanted)):
             errors.append('Повтор ID в SOURCE_MANIFEST')
         if set(source_ids) != set(wanted):
             errors.append('Покрытие исходных ID в индексе не совпадает с манифестом')
         for number, cells in table_rows(index):
-            if cells and cells[0].startswith('<a id=') and cells[-1] not in STATUSES:
+            if not cells or not cells[0].startswith('<a id='):
+                continue
+            if len(cells) != 6 or not cells[1]:
+                errors.append(f'Индекс:{number}: пустое описание или неверное число столбцов')
+                continue
+            if cells[-1] not in STATUSES:
                 errors.append(f'Индекс:{number}: неверный статус {cells[-1]}')
+            ident = cells[0].split('</a>', 1)[-1].strip()
+            entry = next((e for e in entries if e['id'] == ident), None)
+            if entry:
+                pinned = f'https://github.com/{manifest["repository"]}/blob/{manifest["commit"]}/{manifest["path"]}'
+                expected = f'{pinned}#L{entry["start"]}-L{entry["end"]}'
+                if f']({expected})' not in cells[2]:
+                    errors.append(f'Индекс:{number}: ссылка не соответствует диапазону/commit источника')
+            for task_id, target in re.findall(r'\[([^]]+)\]\(([^)]+)\)', cells[4]):
+                if task_id not in tasks:
+                    errors.append(f'Индекс:{number}: неизвестная связанная задача {task_id}')
+                elif (dev / target).resolve() != stages[tasks[task_id]['stage']]['path'].resolve():
+                    errors.append(f'Индекс:{number}: задача {task_id} ссылается на чужой этап')
+    task_index_path = dev / 'tasks/README.md'
+    if task_index_path.is_file():
+        for _, cells in table_rows(task_index_path.read_text(encoding='utf-8')):
+            link = re.fullmatch(r'\[([^]]+)\]\(([^)]+)\)', cells[0])
+            if not link:
+                continue
+            ident = link.group(1)
+            if ident not in tasks or len(cells) != 5:
+                errors.append(f'Список TASK: неизвестный пакет {ident}')
+            elif cells[1] != tasks[ident]['status']:
+                errors.append(f'{ident}: статус в списке TASK не совпадает с этапом')
+    review_path = dev / 'handoffs/FULL-REVIEW.md'
+    if review_path.is_file():
+        review = review_path.read_text(encoding='utf-8')
+        if field(review, 'SHA-256 источника') != manifest.get('sha256'):
+            errors.append('Полная вычитка: SHA-256 не совпадает с манифестом')
+        if field(review, 'Записей источника') != str(len(entries)):
+            errors.append('Полная вычитка: неверное число записей')
+        covered_until = 0
+        for _, cells in table_rows(review):
+            match = re.fullmatch(r'(\d+)–(\d+)', cells[0])
+            if not match:
+                continue
+            start, end = map(int, match.groups())
+            if start != covered_until + 1 or end < start:
+                errors.append('Полная вычитка: пропуск/перекрытие диапазонов чтения')
+            covered_until = end
+        if covered_until != manifest.get('lines'):
+            errors.append('Полная вычитка: диапазоны не покрывают весь источник')
     if source:
         payload = source.read_bytes()
         if hashlib.sha256(payload).hexdigest() != manifest.get('sha256'):
